@@ -1,26 +1,7 @@
 // Description: A simple DNS monitor that captures DNS packets from a given interface or a PCAP file.
 // Author: Nikita Koliada xkolia00
 
-#include <pcap.h>
-#include <netinet/ip.h>
-#include <netinet/udp.h>
-#include <arpa/inet.h>
-#include <resolv.h>
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-
-#define DNSPORT 53
-
-// DNS question types
-#define DNS_A 1
-#define DNS_NS 2
-#define DNS_CNAME 5
-#define DNS_SOA 6
-#define DNS_MX 15
-#define DNS_AAAA 28
-#define DNS_SRV 33
+#include "dns-monitor.h"
 
 const char *dns_type_to_str(unsigned short type)
 {
@@ -76,17 +57,6 @@ int get_size_of_domain_name(u_char *payload, char *name)
     return size;
 }
 
-// DNS header
-struct dnshdr
-{
-    uint16_t id;
-    uint16_t flags;
-    uint16_t qdcount; // number of questions
-    uint16_t ancount; // number of answers
-    uint16_t nscount; // number of authoritative records
-    uint16_t arcount; // number of additional records
-};
-
 // Utility function to check if an exact line exists in the file
 int line_exists_in_file(FILE *file, const char *line_to_check)
 {
@@ -107,9 +77,15 @@ int line_exists_in_file(FILE *file, const char *line_to_check)
 // Append a domain name to the file if it doesn't already exist
 void append_domain_if_not_exists(FILE *file, const char *domain)
 {
-    if (file && !line_exists_in_file(file, domain))
+    // Create a modified copy of domain, removing dot 
+    size_t len = strlen(domain);
+    char *modified_domain = strdup(domain);
+    if (modified_domain && len > 0 && modified_domain[len - 1] == '.') {
+        modified_domain[len - 1] = '\0';
+    }
+    if (file && !line_exists_in_file(file, modified_domain))
     {
-        fprintf(file, "%s\n", domain);
+        fprintf(file, "%s\n", modified_domain);
         fflush(file); // Ensure the line is written to the file immediately
     }
 }
@@ -117,8 +93,14 @@ void append_domain_if_not_exists(FILE *file, const char *domain)
 // Append a domain name + ip address to the file if it doesn't already exist
 void append_transaction_if_not_exists(FILE *file, const char *domain, const char *ip_address)
 {
-    char *line = (char *)malloc(strlen(domain) + strlen(ip_address) + 2);
-    sprintf(line, "%s %s", domain, ip_address);
+    // Create a modified copy of domain, removing dot 
+    size_t len = strlen(domain);
+    char *modified_domain = strdup(domain);
+    if (modified_domain && len > 0 && modified_domain[len - 1] == '.') {
+        modified_domain[len - 1] = '\0';
+    }
+    char *line = (char *)malloc(strlen(modified_domain) + strlen(ip_address) + 2);
+    sprintf(line, "%s %s", modified_domain, ip_address);
     if (file && !line_exists_in_file(file, line))
     {
         fprintf(file, "%s\n", line);
@@ -198,7 +180,7 @@ void extract_domain_name(u_char *payload, u_char *msg_buffer, char *domain_name)
     }
 }
 
-int process_dns_question(char *output_buffer, u_char **payload, u_char *buffer, FILE *domain_file)
+int process_dns_question(char *output_buffer, u_char **payload, u_char *buffer, FILE *domain_file, int verbose)
 {
     // Parse the DNS name from the question section
 
@@ -218,14 +200,17 @@ int process_dns_question(char *output_buffer, u_char **payload, u_char *buffer, 
         if (strcmp(record_type, "UNKNOWN") != 0)
         {
             append_domain_if_not_exists(domain_file, dns_name);
-            printf("%s", output_buffer);
+            if (verbose == 1)
+            {
+                printf("%s", output_buffer);
+            }
             return 1; // if 1 then continue to the answer/authotity/additional section
         }
     }
     return 0;
 }
 
-void process_dns_records(u_char **payload, u_char *buffer, unsigned short count, FILE *translation_file, FILE *domain_file)
+void process_dns_records(u_char **payload, u_char *buffer, unsigned short count, FILE *translation_file, FILE *domain_file, int verbose)
 {
     for (unsigned short i = 0; i < count; i++)
     {
@@ -246,8 +231,9 @@ void process_dns_records(u_char **payload, u_char *buffer, unsigned short count,
 
         // Read the type and class
         unsigned short rtype = ntohs(*(unsigned short *)(*payload));
-        // unsigned short rclass = ntohs(*(unsigned short *)(*payload + *offset + 2));
-        // unsigned int ttl = ntohl(*(unsigned int *)(*payload + *offset + 4));
+        unsigned short rclass = ntohs(*(unsigned short *)(*payload + 2));
+        char *rclass_str = (rclass == 1) ? "IN" : "UNKNOWN";
+        unsigned int ttl = ntohl(*(unsigned int *)(*payload + 4));
         unsigned short rdlength = ntohs(*(unsigned short *)(*payload + 8));
 
         *payload += 10; // Move past type, class, TTL, and RDLength
@@ -261,7 +247,10 @@ void process_dns_records(u_char **payload, u_char *buffer, unsigned short count,
             struct in_addr addr;
             memcpy(&addr, *payload, sizeof(addr));
             append_transaction_if_not_exists(translation_file, dns_name, inet_ntoa(addr));
-            printf("%s IN A %s\n", dns_name, inet_ntoa(addr));
+            if (verbose == 1)
+            {
+                printf("%s %d %s A %s\n", dns_name, ttl, rclass_str, inet_ntoa(addr));
+            }
             break;
         }
         case DNS_NS:
@@ -270,7 +259,10 @@ void process_dns_records(u_char **payload, u_char *buffer, unsigned short count,
             // Parse the NS name
             extract_domain_name(*payload, buffer, ns_name);
             append_domain_if_not_exists(domain_file, ns_name);
-            printf("%s IN NS %s\n", dns_name, ns_name);
+            if (verbose == 1)
+            {
+                printf("%s %d %s NS %s\n", dns_name, ttl, rclass_str, ns_name);
+            }
             break;
         }
         case DNS_CNAME:
@@ -279,7 +271,10 @@ void process_dns_records(u_char **payload, u_char *buffer, unsigned short count,
             char cname[256] = {0};
             extract_domain_name(*payload, buffer, cname);
             append_domain_if_not_exists(domain_file, cname);
-            printf("%s IN CNAME %s\n", dns_name, cname);
+            if (verbose == 1)
+            {
+                printf("%s %d %s CNAME %s\n", dns_name, ttl, rclass_str, cname);
+            }
             break;
         }
         case DNS_SOA:
@@ -290,7 +285,7 @@ void process_dns_records(u_char **payload, u_char *buffer, unsigned short count,
 
             *payload += get_size_of_domain_name(*payload, mname);
 
-            // Parse RNAME
+            // Parse RNAME email address
             extract_domain_name(*payload, buffer, rname);
 
             *payload += get_size_of_domain_name(*payload, rname);
@@ -303,9 +298,10 @@ void process_dns_records(u_char **payload, u_char *buffer, unsigned short count,
             unsigned int minimum = ntohl(*(unsigned int *)(*payload + 16));
 
             append_domain_if_not_exists(domain_file, mname);
-            append_domain_if_not_exists(domain_file, rname);
-
-            printf("%s IN SOA %s %s %u %u %u %u %u\n", dns_name, mname, rname, serial, refresh, retry, expire, minimum);
+            if (verbose == 1)
+            {
+                printf("%s %d %s SOA %s %s %u %u %u %u %u\n", dns_name, ttl, rclass_str, mname, rname, serial, refresh, retry, expire, minimum);
+            }
             break;
         }
         case DNS_MX:
@@ -314,7 +310,10 @@ void process_dns_records(u_char **payload, u_char *buffer, unsigned short count,
             char mx_name[256] = {0};
             extract_domain_name((*payload + 2), buffer, mx_name);
             append_domain_if_not_exists(domain_file, mx_name);
-            printf("%s IN MX %u %s\n", dns_name, preference, mx_name);
+            if (verbose == 1)
+            {
+                printf("%s %d %s MX %u %s\n", dns_name, ttl, rclass_str, preference, mx_name);
+            }
             break;
         }
         case DNS_AAAA:
@@ -322,7 +321,10 @@ void process_dns_records(u_char **payload, u_char *buffer, unsigned short count,
             char addr[INET6_ADDRSTRLEN];
             inet_ntop(AF_INET6, *payload, addr, sizeof(addr));
             append_transaction_if_not_exists(translation_file, dns_name, addr);
-            printf("%s IN AAAA %s\n", dns_name, addr);
+            if (verbose == 1)
+            {
+                printf("%s %d %s AAAA %s\n", dns_name, ttl, rclass_str, addr);
+            }
             break;
         }
         case DNS_SRV:
@@ -336,7 +338,10 @@ void process_dns_records(u_char **payload, u_char *buffer, unsigned short count,
 
             append_domain_if_not_exists(domain_file, srv_name);
 
-            printf("%s IN SRV %u %u %u %s\n", dns_name, priority, weight, port, srv_name);
+            if (verbose == 1)
+            {
+                printf("%s %d %s SRV %u %u %u %s\n", dns_name, ttl, rclass_str, priority, weight, port, srv_name);
+            }
             break;
         }
         default:
@@ -362,7 +367,11 @@ void process_dns(const u_char *packet, int packet_size, int verbose, FILE *domai
 
     if (ntohs(udp_header->uh_dport) == DNSPORT || ntohs(udp_header->uh_sport) == DNSPORT)
     {
-
+        if (ip_header == NULL || udp_header == NULL || dns_header == NULL)
+        {
+            printf("Error parsing the DNS packet\n");
+            return;
+        }
         if (!verbose)
         {
             char time_stamp[1028] = {0};
@@ -374,49 +383,60 @@ void process_dns(const u_char *packet, int packet_size, int verbose, FILE *domai
                    ntohs(dns_header->qdcount), ntohs(dns_header->ancount),
                    ntohs(dns_header->nscount), ntohs(dns_header->arcount));
         }
-        else
+
+        char output_buffer[1028] = {0};
+        sprintf(output_buffer + strlen(output_buffer), "Timestamp: ");
+        sprintf(output_buffer + strlen(output_buffer), "%s", print_timestamp());
+        char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(ip_header->ip_src), src_ip, INET_ADDRSTRLEN);
+        inet_ntop(AF_INET, &(ip_header->ip_dst), dst_ip, INET_ADDRSTRLEN);
+        sprintf(output_buffer + strlen(output_buffer), "\nSrcIP: %s\nDstIP: %s", src_ip, dst_ip);
+        sprintf(output_buffer + strlen(output_buffer), "\nSrcPort: UDP/%d\nDstPort: UDP/%d\n", ntohs(udp_header->uh_sport), ntohs(udp_header->uh_dport));
+        sprintf(output_buffer + strlen(output_buffer), "Identifier: 0x%X\n", ntohs(dns_header->id));
+        sprintf(output_buffer + strlen(output_buffer), "%s", print_dns_flags(dns_header->flags));
+
+        // Process DNS questions
+        sprintf(output_buffer + strlen(output_buffer), "\n[Question Section]\n");
+        for (int i = 0; i < ntohs(dns_header->qdcount); i++)
         {
-            char output_buffer[1028] = {0};
-            sprintf(output_buffer + strlen(output_buffer), "Timestamp: ");
-            sprintf(output_buffer + strlen(output_buffer), "%s", print_timestamp());
-            char src_ip[INET_ADDRSTRLEN], dst_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &(ip_header->ip_src), src_ip, INET_ADDRSTRLEN);
-            inet_ntop(AF_INET, &(ip_header->ip_dst), dst_ip, INET_ADDRSTRLEN);
-            sprintf(output_buffer + strlen(output_buffer), "\nSrcIP: %s\nDstIP: %s", src_ip, dst_ip);
-            sprintf(output_buffer + strlen(output_buffer), "\nSrcPort: UDP/%d\nDstPort: UDP/%d\n", ntohs(udp_header->uh_sport), ntohs(udp_header->uh_dport));
-            sprintf(output_buffer + strlen(output_buffer), "Identifier: 0x%X\n", ntohs(dns_header->id));
-            sprintf(output_buffer + strlen(output_buffer), "%s", print_dns_flags(dns_header->flags));
-
-            // Process DNS questions
-            sprintf(output_buffer + strlen(output_buffer), "\n[Question Section]\n");
-            for (int i = 0; i < ntohs(dns_header->qdcount); i++)
+            int question_result = process_dns_question(output_buffer, &payload, buffer, domain_file, verbose);
+            if (question_result == 0)
             {
-                int question_result = process_dns_question(output_buffer, &payload, buffer, domain_file);
-                if (question_result == 0)
-                {
-                    return;
-                }
+                return;
             }
+        }
 
-            // Process DNS answers
-            if (ntohs(dns_header->ancount) > 0)
+        // Process DNS answers
+        if (ntohs(dns_header->ancount) > 0)
+        {
+            if (verbose == 1)
             {
                 printf("\n[Answer Section]\n");
-                process_dns_records(&payload, buffer, ntohs(dns_header->ancount), translation_file, domain_file);
             }
+            process_dns_records(&payload, buffer, ntohs(dns_header->ancount), translation_file, domain_file, verbose);
+        }
 
-            // Process Authority records
-            if (ntohs(dns_header->nscount) > 0)
+        // Process Authority records
+        if (ntohs(dns_header->nscount) > 0)
+        {
+
+            if (verbose == 1)
             {
                 printf("\n[Authority Section]\n");
-                process_dns_records(&payload, buffer, ntohs(dns_header->nscount), translation_file, domain_file);
             }
-            // Process Additional records
-            if (ntohs(dns_header->arcount) > 0)
+            process_dns_records(&payload, buffer, ntohs(dns_header->nscount), translation_file, domain_file, verbose);
+        }
+        // Process Additional records
+        if (ntohs(dns_header->arcount) > 0)
+        {
+            if (verbose == 1)
             {
                 printf("\n[Additional Section]\n");
-                process_dns_records(&payload, buffer, ntohs(dns_header->arcount), translation_file, domain_file);
             }
+            process_dns_records(&payload, buffer, ntohs(dns_header->arcount), translation_file, domain_file, verbose);
+        }
+        if (verbose == 1)
+        {
             printf("====================\n");
         }
     }
@@ -429,7 +449,7 @@ void packet_handler(u_char *args, const struct pcap_pkthdr *header, const u_char
     process_dns(packet, header->caplen, files[0] != NULL, files[1], files[2]);
 }
 
-// Function to capture packets from a given interface
+// Function to capture packets from a given interface/file
 void capture_packets(const char *source, int is_pcap_file, int verbose, FILE *domain_file, FILE *translation_file)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -490,7 +510,7 @@ int main(int argc, char *argv[])
     char *interface = NULL;
     char *pcap_file = NULL;
     int use_pcap_file = 0;
-    
+
     // Flag to check if needed to write to the domain file
     FILE *domain_file = NULL;
     // Flag to check if needed to write to the translation file
